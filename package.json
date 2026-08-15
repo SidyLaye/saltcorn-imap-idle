@@ -1,7 +1,7 @@
 {
   "name": "imap-idle",
-  "version": "1.6.0",
-  "description": "IMAP IDLE Saltcorn V16 - correctif detection Setup/configuration_workflow et chargement paresseux",
+  "version": "1.7.0",
+  "description": "IMAP IDLE Saltcorn V17 - registerPlugin/configuration_workflow compatibility fix",
   "main": "index.js",
   "license": "MIT",
   "dependencies": {

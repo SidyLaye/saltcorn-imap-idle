@@ -1,14 +1,15 @@
 /**
- * imap-idle V16 — Sélection Habitat
+ * imap-idle V17 — Sélection Habitat
  *
- * V16 cible spécifiquement la détection du Setup (engrenage) par Saltcorn :
- * - aucun import Saltcorn n'est exécuté au chargement initial du module ;
- * - `configuration_workflow` est donc visible dès que index.js est réellement chargé ;
- * - `plugin_name` n'est pas forcé : Saltcorn utilise le Name de l'installation ;
- * - les imports Saltcorn/IMAP sont chargés paresseusement au moment où ils servent ;
- * - marqueurs V16 dans stdout et dans les logs Saltcorn pour vérifier la version active.
+ * V17 corrige le contrat moderne de registerPlugin() de Saltcorn :
+ * - `configuration_workflow` reste une fonction sans import Saltcorn au chargement initial ;
+ * - quand un plugin a `configuration_workflow`, Saltcorn appelle `functions(config)`,
+ *   `actions(config)` et `eventTypes(config)` pendant registerPlugin();
+ * - ces trois exports sont donc désormais des factories conformes au core Saltcorn ;
+ * - `plugin_name` n'est pas forcé ;
+ * - marqueurs V17 dans stdout et dans les logs Saltcorn pour vérifier la version active.
  */
-console.log("### AMBS IMAP V16 MODULE EVALUATED - SETUP FIX ###");
+console.log("### AMBS IMAP V17 MODULE EVALUATED - REGISTERPLUGIN FIX ###");
 
 const cluster = require("cluster");
 
@@ -49,7 +50,7 @@ const cfg = () => {
 };
 
 const configuration_workflow = () => {
-  console.log("### AMBS IMAP V16 configuration_workflow CALLED ###");
+  console.log("### AMBS IMAP V17 configuration_workflow CALLED ###");
   const Workflow = require("@saltcorn/data/models/workflow");
   const Form = require("@saltcorn/data/models/form");
 
@@ -210,7 +211,7 @@ const startSupervisor = async (tenant) => {
 const onLoad = async (configuration) => {
   // IMPORTANT : mémorisé AVANT toute opération susceptible d'échouer.
   CURRENT_CFG = { ...(configuration || {}) };
-  console.log("### AMBS IMAP V16 onLoad CALLED ###");
+  console.log("### AMBS IMAP V17 onLoad CALLED ###");
 
   try {
     const db = getDb();
@@ -290,11 +291,35 @@ const actionTester = async () => {
   }
 };
 
-// DICTIONNAIRE STATIQUE : c'est le point qui manquait aux versions précédentes.
-const actions = {
+// IMPORTANT SALTCORN MODERNE:
+// Dès qu'un plugin expose configuration_workflow, State.registerPlugin() appelle
+// chaque surface configurable comme une fonction avec la configuration sauvegardée.
+// Il ne faut donc PAS exporter ici des dictionnaires statiques.
+const requirePluginCfg = (pluginConfig = {}) => {
+  const c = { ...(pluginConfig || {}) };
+  if (!c.host || !c.username || !c.table_dest) {
+    throw new Error(
+      "Configuration IMAP incomplète. Ouvre l'engrenage du module et enregistre la configuration."
+    );
+  }
+  return c;
+};
+
+const actions = (pluginConfig = {}) => ({
   imap_idle_sync: {
     configFields: [],
-    run: actionSync,
+    run: async () => {
+      const c = requirePluginCfg(pluginConfig);
+      const db = getDb();
+      const Trigger = getTrigger();
+      const tenant = db.getTenantSchema();
+      const s = loadSync();
+      return await s.runSync(c, async (payload) =>
+        await db.runWithTenant(tenant, async () =>
+          await Trigger.emitEvent("MailRecu", c.folder || "INBOX", null, payload)
+        )
+      );
+    },
   },
   imap_import_periode: {
     configFields: [
@@ -303,7 +328,10 @@ const actions = {
       { name: "dry_run", label: "Scanner seulement", type: "Bool", default: false },
       { name: "replace_existing", label: "Mettre à jour UID existants", type: "Bool", default: false },
     ],
-    run: actionImportPeriod,
+    run: async ({ configuration = {}, ...rest } = {}) => {
+      const c = requirePluginCfg(pluginConfig);
+      return await loadSync().importPeriod(c, { ...configuration, ...rest });
+    },
   },
   imap_idle_maintenance: {
     configFields: [
@@ -313,31 +341,53 @@ const actions = {
   },
   imap_idle_tester: {
     configFields: [],
-    run: actionTester,
+    run: async () => {
+      const c = requirePluginCfg(pluginConfig);
+      let client = null;
+      try {
+        const s = loadSync();
+        s.assertDependencies();
+        client = s.makeClient(c);
+        await client.connect();
+        const box = await client.mailboxOpen(c.folder || "INBOX", { readOnly: true });
+        return {
+          ok: true,
+          folder: c.folder || "INBOX",
+          uid_next: box.uidNext || null,
+          uid_validity: box.uidValidity ? String(box.uidValidity) : null,
+        };
+      } finally {
+        if (client) { try { await client.logout(); } catch (_) {} }
+      }
+    },
   },
-};
+});
 
-// Fonctions également exposées au code Saltcorn, pour avoir une seconde porte
-// d'entrée indépendante de l'objet Actions.
-const functions = {
+const functions = (pluginConfig = {}) => ({
   imap_import_periode_fn: {
-    run: async (start_utc, end_utc, dry_run = false) =>
-      await loadSync().importPeriod(cfg(), { start_utc, end_utc, dry_run }),
+    run: async (start_utc, end_utc, dry_run = false) => {
+      const c = requirePluginCfg(pluginConfig);
+      return await loadSync().importPeriod(c, { start_utc, end_utc, dry_run });
+    },
     isAsync: true,
-    description: "Importe une période IMAP avec la configuration déjà enregistrée du plugin",
+    description: "Importe une période IMAP avec la configuration enregistrée du plugin",
     arguments: [
       { name: "start_utc", type: "String" },
       { name: "end_utc", type: "String" },
       { name: "dry_run", type: "Bool" },
     ],
   },
-};
+});
+
+const eventTypes = (_pluginConfig = {}) => ({
+  MailRecu: { hasChannel: true },
+});
 
 module.exports = {
   sc_plugin_api_version: 1,
   configuration_workflow,
   onLoad,
-  eventTypes: { MailRecu: { hasChannel: true } },
+  eventTypes,
   actions,
   functions,
 };
