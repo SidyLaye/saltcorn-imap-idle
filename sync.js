@@ -241,4 +241,124 @@ const runSync = async (cfg, onMessage) => runSyncCore(cfg, onMessage, db.getTena
 const runSyncForTenant = async (cfg, tenant, onMessage) =>
   db.runWithTenant(tenant, async () => runSyncCore(cfg, onMessage, tenant));
 
-module.exports = { runSync, runSyncForTenant, makeClient, log, assertDependencies };
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Import ciblé par période IMAP, SANS déclencher le workflow.
+ *
+ * startUtc inclus, endUtc exclu. La recherche se fait côté serveur IMAP sur
+ * l'INTERNALDATE. Les messages sont ensuite lus avec leur UID et insérés dans
+ * la table configurée du plugin.
+ * ────────────────────────────────────────────────────────────────────────── */
+const asDate = (v, label) => {
+  const d = v instanceof Date ? v : new Date(v);
+  if (!Number.isFinite(d.getTime())) throw new Error(`${label} invalide : ${v}`);
+  return d;
+};
+
+const importPeriod = async (cfg, opts = {}) => {
+  assertDependencies();
+  if (!cfg || !cfg.host || !cfg.username || !cfg.table_dest)
+    throw new Error("configuration IMAP incomplète");
+
+  const start = asDate(opts.start_utc || opts.startUtc, "start_utc");
+  const end = asDate(opts.end_utc || opts.endUtc, "end_utc");
+  if (end <= start) throw new Error("end_utc doit être postérieur à start_utc");
+
+  const dryRun = opts.dry_run === true || opts.dryRun === true;
+  const replaceExisting = opts.replace_existing === true || opts.replaceExisting === true;
+
+  const table = Table.findOne({ name: cfg.table_dest });
+  if (!table) throw new Error(`table destination introuvable : ${cfg.table_dest}`);
+
+  const client = makeClient(cfg);
+  let matched = [];
+  let inserted = 0;
+  let updated = 0;
+  let skipped = 0;
+  const errors = [];
+
+  try {
+    await client.connect();
+    await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: true });
+
+    matched = await client.search(
+      { since: start, before: end },
+      { uid: true }
+    );
+    matched = (Array.isArray(matched) ? matched : [])
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .sort((a, b) => a - b);
+
+    if (dryRun) {
+      return {
+        ok: true,
+        dry_run: true,
+        folder: cfg.folder || "INBOX",
+        start_utc: start.toISOString(),
+        end_utc: end.toISOString(),
+        matched: matched.length,
+        first_uid: matched[0] || null,
+        last_uid: matched.length ? matched[matched.length - 1] : null,
+      };
+    }
+
+    const uidField = cfg.f_uid || "uid";
+    const chunks = [];
+    for (let i = 0; i < matched.length; i += 100) chunks.push(matched.slice(i, i + 100));
+
+    for (const chunk of chunks) {
+      if (!chunk.length) continue;
+      const seq = chunk.join(",");
+
+      for await (const message of client.fetch(
+        seq,
+        { uid: true, source: true, envelope: true, internalDate: true },
+        { uid: true }
+      )) {
+        try {
+          if (!message.uid) continue;
+          const row = await parseMessage(cfg, message);
+          const uid = Number(message.uid);
+          const existing = (await table.getRows({ [uidField]: uid }, { limit: 1 }))[0];
+
+          if (existing) {
+            if (replaceExisting) {
+              await table.updateRow(row, existing.id);
+              updated++;
+            } else {
+              skipped++;
+            }
+            continue;
+          }
+
+          await table.insertRow(row);
+          inserted++;
+        } catch (e) {
+          errors.push({
+            uid: Number(message.uid) || null,
+            error: String(e && e.message ? e.message : e).slice(0, 500),
+          });
+        }
+      }
+    }
+
+    return {
+      ok: errors.length === 0,
+      dry_run: false,
+      folder: cfg.folder || "INBOX",
+      start_utc: start.toISOString(),
+      end_utc: end.toISOString(),
+      matched: matched.length,
+      inserted,
+      updated,
+      skipped,
+      errors,
+    };
+  } finally {
+    try { await client.logout(); } catch (_) {}
+  }
+};
+
+module.exports = { runSync, runSyncForTenant, makeClient, log, assertDependencies, importPeriod, payloadFromRow };
+

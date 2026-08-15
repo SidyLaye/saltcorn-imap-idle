@@ -1,9 +1,13 @@
 /**
- * imap-idle V11 — plugin Saltcorn pour la relève Sélection Habitat.
+ * imap-idle V15 — Sélection Habitat
  *
- * POINT IMPORTANT V11 : ./sync, imapflow et mailparser ne sont pas chargés au
- * chargement initial du plugin. La configuration (engrenage), MailRecu et les
- * actions restent donc enregistrés même si une dépendance IMAP est absente.
+ * Correction structurelle Saltcorn :
+ * - `actions` est un DICTIONNAIRE statique (conforme au modèle de plugin),
+ *   pas une fonction `actions(cfg)`.
+ * - la configuration du plugin est mémorisée dans CURRENT_CFG par onLoad().
+ * - les dépendances IMAP restent chargées paresseusement.
+ * - une action `imap_import_periode` permet au Run JS de demander une reprise
+ *   précise dans la boîte sans ressaisir serveur/login/mot de passe.
  */
 const Workflow = require("@saltcorn/data/models/workflow");
 const Form = require("@saltcorn/data/models/form");
@@ -12,7 +16,9 @@ const Trigger = require("@saltcorn/data/models/trigger");
 const db = require("@saltcorn/data/db");
 const cluster = require("cluster");
 
+let CURRENT_CFG = {};
 const supervisors = new Map();
+const maintenanceTenants = new Set();
 
 const safeLog = (level, msg) => {
   try {
@@ -28,10 +34,19 @@ const loadSync = () => {
     return require("./sync");
   } catch (e) {
     throw new Error(
-      "imap-idle est chargé, mais son moteur de relève est indisponible : " +
+      "imap-idle est chargé mais le moteur IMAP est indisponible : " +
       (e && e.message ? e.message : String(e))
     );
   }
+};
+
+const cfg = () => {
+  if (!CURRENT_CFG || !CURRENT_CFG.host || !CURRENT_CFG.username || !CURRENT_CFG.table_dest) {
+    throw new Error(
+      "Configuration IMAP non chargée. Ouvre l'engrenage du module, enregistre la configuration puis recharge les plugins."
+    );
+  }
+  return CURRENT_CFG;
 };
 
 const configuration_workflow = () =>
@@ -40,8 +55,7 @@ const configuration_workflow = () =>
       {
         name: "Compte IMAP",
         form: () => new Form({ fields: [
-          { name: "host", label: "Serveur IMAP", type: "String", required: true,
-            sublabel: "Nom du serveur seul, sans https:// ni port" },
+          { name: "host", label: "Serveur IMAP", type: "String", required: true },
           { name: "port", label: "Port", type: "Integer", default: 993 },
           { name: "tls", label: "TLS", type: "Bool", default: true },
           { name: "username", label: "Identifiant", type: "String", required: true },
@@ -82,8 +96,8 @@ const configuration_workflow = () =>
   });
 
 class IdleSupervisor {
-  constructor(cfg, tenant) {
-    this.cfg = cfg;
+  constructor(config, tenant) {
+    this.cfg = config;
     this.tenant = tenant;
     this.stopped = false;
     this.client = null;
@@ -92,6 +106,7 @@ class IdleSupervisor {
   }
 
   async start() {
+    if (maintenanceTenants.has(this.tenant)) return;
     await this.sync("démarrage");
     if (Number(this.cfg.safety_poll_s || 0) > 0) {
       this.timer = setInterval(
@@ -103,17 +118,18 @@ class IdleSupervisor {
   }
 
   async emit(payload) {
+    if (maintenanceTenants.has(this.tenant)) return;
     return await db.runWithTenant(this.tenant, async () =>
       await Trigger.emitEvent("MailRecu", this.cfg.folder || "INBOX", null, payload)
     );
   }
 
   async sync(cause) {
-    if (this.busy || this.stopped) return;
+    if (this.busy || this.stopped || maintenanceTenants.has(this.tenant)) return;
     this.busy = true;
     try {
-      const sync = loadSync();
-      const counts = await sync.runSyncForTenant(this.cfg, this.tenant, (p) => this.emit(p));
+      const s = loadSync();
+      const counts = await s.runSyncForTenant(this.cfg, this.tenant, (p) => this.emit(p));
       if (counts.inserted || counts.emitted || counts.replayed) {
         safeLog(4, `${cause} : ${counts.inserted || 0} enregistré(s), ` +
           `${counts.emitted || 0} nouveau(x), ${counts.replayed || 0} rejeu(x)`);
@@ -126,30 +142,32 @@ class IdleSupervisor {
   }
 
   async loop() {
-    while (!this.stopped) {
+    while (!this.stopped && !maintenanceTenants.has(this.tenant)) {
       let client = null;
       try {
-        const sync = loadSync();
-        client = sync.makeClient(this.cfg);
+        const s = loadSync();
+        client = s.makeClient(this.cfg);
         this.client = client;
         await client.connect();
         await client.mailboxOpen(this.cfg.folder || "INBOX", { readOnly: true });
         safeLog(4, `IDLE actif sur ${this.cfg.folder || "INBOX"}`);
-        client.on("exists", () => setImmediate(() => this.sync("notification IDLE")));
+
+        client.on("exists", () => {
+          if (!maintenanceTenants.has(this.tenant))
+            setImmediate(() => this.sync("notification IDLE"));
+        });
         client.on("error", (e) => safeLog(2, `erreur IDLE : ${e.message}`));
 
-        while (!this.stopped) {
+        while (!this.stopped && !maintenanceTenants.has(this.tenant)) {
           await client.idle({ maxIdleTime: Number(this.cfg.idle_renew_s || 240) * 1000 });
         }
       } catch (e) {
-        if (this.stopped) break;
+        if (this.stopped || maintenanceTenants.has(this.tenant)) break;
         const wait = Number(this.cfg.reconnect_s || 30) * 1000;
-        safeLog(2, `connexion IDLE perdue (${e.message}) — nouvelle tentative dans ${wait / 1000}s`);
+        safeLog(2, `connexion IDLE perdue (${e.message}) — reconnexion dans ${wait / 1000}s`);
         await new Promise((r) => setTimeout(r, wait));
       } finally {
-        if (client) {
-          try { await client.logout(); } catch (_) {}
-        }
+        if (client) { try { await client.logout(); } catch (_) {} }
         this.client = null;
       }
     }
@@ -158,34 +176,149 @@ class IdleSupervisor {
   async stop() {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
-    if (this.client) {
-      try { await this.client.logout(); } catch (_) {}
-    }
+    this.timer = null;
+    if (this.client) { try { await this.client.logout(); } catch (_) {} }
+    this.client = null;
   }
 }
 
-const onLoad = async (cfg) => {
+const stopSupervisor = async (tenant) => {
+  const sup = supervisors.get(tenant);
+  if (sup) {
+    try { await sup.stop(); } catch (_) {}
+    supervisors.delete(tenant);
+  }
+};
+
+const startSupervisor = async (tenant) => {
+  if (maintenanceTenants.has(tenant)) return;
+  const c = cfg();
+  await stopSupervisor(tenant);
+  if (cluster.isWorker) return;
+  const sup = new IdleSupervisor(c, tenant);
+  supervisors.set(tenant, sup);
+  sup.start().catch((e) => safeLog(1, `démarrage impossible : ${e.message}`));
+};
+
+const onLoad = async (configuration) => {
+  // IMPORTANT : mémorisé AVANT toute opération susceptible d'échouer.
+  CURRENT_CFG = { ...(configuration || {}) };
+
   try {
     const tenant = db.getTenantSchema();
-    const previous = supervisors.get(tenant);
-    if (previous) await previous.stop();
-    supervisors.delete(tenant);
+    await stopSupervisor(tenant);
 
-    if (!cfg || !cfg.host || !cfg.username || !cfg.table_dest) return;
-    // Un worker secondaire n'ouvre pas une deuxième session IDLE.
+    if (!CURRENT_CFG.host || !CURRENT_CFG.username || !CURRENT_CFG.table_dest) return;
     if (cluster.isWorker) return;
 
-    // Teste les dépendances, mais NE PROPAGE JAMAIS l'erreur au chargeur de plugin.
-    // L'engrenage et les actions restent donc disponibles pour corriger la config.
     try { loadSync().assertDependencies(); }
-    catch (e) { safeLog(1, `supervision IMAP non démarrée : ${e.message}`); return; }
+    catch (e) {
+      safeLog(1, `supervision IMAP non démarrée : ${e.message}`);
+      return;
+    }
 
-    const sup = new IdleSupervisor(cfg, tenant);
-    supervisors.set(tenant, sup);
-    sup.start().catch((e) => safeLog(1, `démarrage impossible : ${e.message}`));
+    if (!maintenanceTenants.has(tenant)) await startSupervisor(tenant);
   } catch (e) {
-    safeLog(1, `onLoad ignoré pour préserver le plugin : ${e.message}`);
+    safeLog(1, `onLoad : ${e.message}`);
   }
+};
+
+const actionSync = async () => {
+  const c = cfg();
+  const tenant = db.getTenantSchema();
+  const s = loadSync();
+  return await s.runSync(c, async (payload) =>
+    await db.runWithTenant(tenant, async () =>
+      await Trigger.emitEvent("MailRecu", c.folder || "INBOX", null, payload)
+    )
+  );
+};
+
+const actionImportPeriod = async ({ configuration = {}, ...rest } = {}) => {
+  const c = cfg();
+  const opts = { ...configuration, ...rest };
+  return await loadSync().importPeriod(c, opts);
+};
+
+const actionMaintenance = async ({ configuration = {}, ...rest } = {}) => {
+  const opts = { ...configuration, ...rest };
+  const active = opts.active === true || opts.active === "true" || opts.active === 1 || opts.active === "1";
+  const tenant = db.getTenantSchema();
+
+  if (active) {
+    maintenanceTenants.add(tenant);
+    await stopSupervisor(tenant);
+    safeLog(4, `maintenance IMAP activée pour ${tenant}`);
+    return { maintenance: true, tenant };
+  }
+
+  maintenanceTenants.delete(tenant);
+  await startSupervisor(tenant);
+  safeLog(4, `maintenance IMAP désactivée pour ${tenant}`);
+  return { maintenance: false, tenant };
+};
+
+const actionTester = async () => {
+  const c = cfg();
+  let client = null;
+  try {
+    const s = loadSync();
+    s.assertDependencies();
+    client = s.makeClient(c);
+    await client.connect();
+    const box = await client.mailboxOpen(c.folder || "INBOX", { readOnly: true });
+    return {
+      ok: true,
+      folder: c.folder || "INBOX",
+      uid_next: box.uidNext || null,
+      uid_validity: box.uidValidity ? String(box.uidValidity) : null,
+    };
+  } finally {
+    if (client) { try { await client.logout(); } catch (_) {} }
+  }
+};
+
+// DICTIONNAIRE STATIQUE : c'est le point qui manquait aux versions précédentes.
+const actions = {
+  imap_idle_sync: {
+    configFields: [],
+    run: actionSync,
+  },
+  imap_import_periode: {
+    configFields: [
+      { name: "start_utc", label: "Début UTC inclus", type: "String" },
+      { name: "end_utc", label: "Fin UTC exclue", type: "String" },
+      { name: "dry_run", label: "Scanner seulement", type: "Bool", default: false },
+      { name: "replace_existing", label: "Mettre à jour UID existants", type: "Bool", default: false },
+    ],
+    run: actionImportPeriod,
+  },
+  imap_idle_maintenance: {
+    configFields: [
+      { name: "active", label: "Maintenance active", type: "Bool", default: true },
+    ],
+    run: actionMaintenance,
+  },
+  imap_idle_tester: {
+    configFields: [],
+    run: actionTester,
+  },
+};
+
+// Fonctions également exposées au code Saltcorn, pour avoir une seconde porte
+// d'entrée indépendante de l'objet Actions.
+const functions = {
+  imap_import_periode_fn: {
+    run: async (start_utc, end_utc, dry_run = false) =>
+      await loadSync().importPeriod(cfg(), { start_utc, end_utc, dry_run }),
+    isAsync: true,
+    description: "Importe une période IMAP avec la configuration déjà enregistrée du plugin",
+    arguments: [
+      { name: "start_utc", type: "String" },
+      { name: "end_utc", type: "String" },
+      { name: "dry_run", type: "Bool" },
+    ],
+  },
 };
 
 module.exports = {
@@ -193,39 +326,7 @@ module.exports = {
   plugin_name: "imap-idle",
   configuration_workflow,
   onLoad,
-  eventTypes: () => ({ MailRecu: { hasChannel: true } }),
-
-  actions: (cfg) => ({
-    imap_idle_sync: {
-      configFields: [],
-      run: async () => {
-        const sync = loadSync();
-        const tenant = db.getTenantSchema();
-        return await sync.runSync(cfg, async (payload) =>
-          await db.runWithTenant(tenant, async () =>
-            await Trigger.emitEvent("MailRecu", cfg.folder || "INBOX", null, payload)
-          )
-        );
-      },
-    },
-
-    imap_idle_tester: {
-      configFields: [],
-      run: async () => {
-        let client = null;
-        try {
-          const sync = loadSync();
-          sync.assertDependencies();
-          client = sync.makeClient(cfg);
-          await client.connect();
-          const box = await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: true });
-          return { notify: `✔ IMAP connecté — ${cfg.folder || "INBOX"} — UIDNEXT ${box.uidNext || "?"}` };
-        } catch (e) {
-          return { error: `✘ ${e.message}` };
-        } finally {
-          if (client) { try { await client.logout(); } catch (_) {} }
-        }
-      },
-    },
-  }),
+  eventTypes: { MailRecu: { hasChannel: true } },
+  actions,
+  functions,
 };

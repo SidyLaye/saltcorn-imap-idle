@@ -1,7 +1,7 @@
 {
   "name": "imap-idle",
-  "version": "1.3.0",
-  "description": "Relève IMAP IDLE Saltcorn pour Sélection Habitat avec rejeu des traitements non terminaux",
+  "version": "1.5.0",
+  "description": "IMAP IDLE Saltcorn avec import ciblé par période et maintenance contrôlée",
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
