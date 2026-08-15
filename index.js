@@ -1,20 +1,19 @@
 /**
- * imap-idle V15 — Sélection Habitat
+ * imap-idle V16 — Sélection Habitat
  *
- * Correction structurelle Saltcorn :
- * - `actions` est un DICTIONNAIRE statique (conforme au modèle de plugin),
- *   pas une fonction `actions(cfg)`.
- * - la configuration du plugin est mémorisée dans CURRENT_CFG par onLoad().
- * - les dépendances IMAP restent chargées paresseusement.
- * - une action `imap_import_periode` permet au Run JS de demander une reprise
- *   précise dans la boîte sans ressaisir serveur/login/mot de passe.
+ * V16 cible spécifiquement la détection du Setup (engrenage) par Saltcorn :
+ * - aucun import Saltcorn n'est exécuté au chargement initial du module ;
+ * - `configuration_workflow` est donc visible dès que index.js est réellement chargé ;
+ * - `plugin_name` n'est pas forcé : Saltcorn utilise le Name de l'installation ;
+ * - les imports Saltcorn/IMAP sont chargés paresseusement au moment où ils servent ;
+ * - marqueurs V16 dans stdout et dans les logs Saltcorn pour vérifier la version active.
  */
-const Workflow = require("@saltcorn/data/models/workflow");
-const Form = require("@saltcorn/data/models/form");
-const Table = require("@saltcorn/data/models/table");
-const Trigger = require("@saltcorn/data/models/trigger");
-const db = require("@saltcorn/data/db");
+console.log("### AMBS IMAP V16 MODULE EVALUATED - SETUP FIX ###");
+
 const cluster = require("cluster");
+
+const getDb = () => require("@saltcorn/data/db");
+const getTrigger = () => require("@saltcorn/data/models/trigger");
 
 let CURRENT_CFG = {};
 const supervisors = new Map();
@@ -49,8 +48,12 @@ const cfg = () => {
   return CURRENT_CFG;
 };
 
-const configuration_workflow = () =>
-  new Workflow({
+const configuration_workflow = () => {
+  console.log("### AMBS IMAP V16 configuration_workflow CALLED ###");
+  const Workflow = require("@saltcorn/data/models/workflow");
+  const Form = require("@saltcorn/data/models/form");
+
+  return new Workflow({
     steps: [
       {
         name: "Compte IMAP",
@@ -69,6 +72,7 @@ const configuration_workflow = () =>
       {
         name: "Table et champs",
         form: async () => {
+          const Table = require("@saltcorn/data/models/table");
           const tables = await Table.find({}, { cached: true });
           return new Form({ fields: [
             { name: "table_dest", label: "Table de destination", input_type: "select",
@@ -94,6 +98,7 @@ const configuration_workflow = () =>
       },
     ],
   });
+};
 
 class IdleSupervisor {
   constructor(config, tenant) {
@@ -119,6 +124,8 @@ class IdleSupervisor {
 
   async emit(payload) {
     if (maintenanceTenants.has(this.tenant)) return;
+    const db = getDb();
+    const Trigger = getTrigger();
     return await db.runWithTenant(this.tenant, async () =>
       await Trigger.emitEvent("MailRecu", this.cfg.folder || "INBOX", null, payload)
     );
@@ -203,8 +210,10 @@ const startSupervisor = async (tenant) => {
 const onLoad = async (configuration) => {
   // IMPORTANT : mémorisé AVANT toute opération susceptible d'échouer.
   CURRENT_CFG = { ...(configuration || {}) };
+  console.log("### AMBS IMAP V16 onLoad CALLED ###");
 
   try {
+    const db = getDb();
     const tenant = db.getTenantSchema();
     await stopSupervisor(tenant);
 
@@ -225,6 +234,8 @@ const onLoad = async (configuration) => {
 
 const actionSync = async () => {
   const c = cfg();
+  const db = getDb();
+  const Trigger = getTrigger();
   const tenant = db.getTenantSchema();
   const s = loadSync();
   return await s.runSync(c, async (payload) =>
@@ -243,6 +254,7 @@ const actionImportPeriod = async ({ configuration = {}, ...rest } = {}) => {
 const actionMaintenance = async ({ configuration = {}, ...rest } = {}) => {
   const opts = { ...configuration, ...rest };
   const active = opts.active === true || opts.active === "true" || opts.active === 1 || opts.active === "1";
+  const db = getDb();
   const tenant = db.getTenantSchema();
 
   if (active) {
@@ -323,7 +335,6 @@ const functions = {
 
 module.exports = {
   sc_plugin_api_version: 1,
-  plugin_name: "imap-idle",
   configuration_workflow,
   onLoad,
   eventTypes: { MailRecu: { hasChannel: true } },
