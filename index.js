@@ -1,15 +1,15 @@
 /**
- * imap-idle V17 — Sélection Habitat
+ * imap-idle V18 — Sélection Habitat
  *
- * V17 corrige le contrat moderne de registerPlugin() de Saltcorn :
+ * V18 corrige le contrat moderne de registerPlugin() de Saltcorn :
  * - `configuration_workflow` reste une fonction sans import Saltcorn au chargement initial ;
  * - quand un plugin a `configuration_workflow`, Saltcorn appelle `functions(config)`,
  *   `actions(config)` et `eventTypes(config)` pendant registerPlugin();
  * - ces trois exports sont donc désormais des factories conformes au core Saltcorn ;
- * - `plugin_name` n'est pas forcé ;
- * - marqueurs V17 dans stdout et dans les logs Saltcorn pour vérifier la version active.
+ * - `plugin_name` est explicitement fixé à `imap-idle` pour correspondre au nom du plugin Saltcorn ;
+ * - marqueurs V18 dans stdout et dans les logs Saltcorn pour vérifier la version active.
  */
-console.log("### AMBS IMAP V17 MODULE EVALUATED - REGISTERPLUGIN FIX ###");
+console.log("### AMBS IMAP V18 MODULE EVALUATED - PLUGIN_NAME=imap-idle ###");
 
 const cluster = require("cluster");
 
@@ -50,7 +50,7 @@ const cfg = () => {
 };
 
 const configuration_workflow = () => {
-  console.log("### AMBS IMAP V17 configuration_workflow CALLED ###");
+  console.log("### AMBS IMAP V18 configuration_workflow CALLED ###");
   const Workflow = require("@saltcorn/data/models/workflow");
   const Form = require("@saltcorn/data/models/form");
 
@@ -211,7 +211,7 @@ const startSupervisor = async (tenant) => {
 const onLoad = async (configuration) => {
   // IMPORTANT : mémorisé AVANT toute opération susceptible d'échouer.
   CURRENT_CFG = { ...(configuration || {}) };
-  console.log("### AMBS IMAP V17 onLoad CALLED ###");
+  console.log("### AMBS IMAP V18 onLoad CALLED ###");
 
   try {
     const db = getDb();
@@ -385,6 +385,7 @@ const eventTypes = (_pluginConfig = {}) => ({
 
 module.exports = {
   sc_plugin_api_version: 1,
+  plugin_name: "imap-idle",
   configuration_workflow,
   onLoad,
   eventTypes,
