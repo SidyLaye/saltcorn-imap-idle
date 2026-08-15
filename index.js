@@ -207,6 +207,7 @@ const configuration_workflow =
           form:
             async () => {
 
+<<<<<<< HEAD
               const tables =
                 await Table.find(
                   {},
@@ -216,6 +217,46 @@ const configuration_workflow =
                   }
                 );
 
+=======
+  /** Une relève, protégée contre le recouvrement. */
+  async sync(cause) {
+    if (this.busy || this.stopped) return;
+    this.busy = true;
+    try {
+      // ★ Un événement par message, émis dès son insertion.
+      //
+      // C'est « MailRecu » qui pilote la chaîne de traitement, pas le
+      // déclencheur Insert de la table. Deux raisons :
+      //
+      //   • L'événement porte une charge utile explicite (identifiant de ligne,
+      //     expéditeur, objet) : le déclencheur sait exactement sur quoi
+      //     travailler, sans relire la table.
+      //   • Le canal est le dossier surveillé. Le jour où plusieurs boîtes sont
+      //     relevées, un déclencheur peut ne réagir qu'à l'une d'elles, sans
+      //     filtrer dans le code.
+      const emit = async (payload) => {
+        await db.runWithTenant(this.tenant, async () => {
+          return await Trigger.emitEvent(
+            "MailRecu",
+            this.cfg.folder || "INBOX",
+            null,
+            payload
+          );
+        });
+      };
+
+      const counts = await runSyncForTenant(this.cfg, this.tenant, emit);
+      if (counts.inserted || counts.emitted || counts.replayed)
+        log(4, `${cause} : ${counts.inserted || 0} enregistré(s), `
+          + `${counts.emitted || 0} événement(s) nouveau(x), `
+          + `${counts.replayed || 0} rejeu(x) pending`);
+    } catch (e) {
+      log(2, `${cause} en échec : ${e.message}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+>>>>>>> ec056b5 (update)
 
               return new Form({
 
@@ -288,13 +329,20 @@ const configuration_workflow =
 
 
 module.exports = {
+<<<<<<< HEAD
 
   sc_plugin_api_version:
     1,
 
+=======
+  sc_plugin_api_version: 1,
+  plugin_name: "imap-idle",
+  version: "8.0.0",
+>>>>>>> ec056b5 (update)
   configuration_workflow,
 
 
+<<<<<<< HEAD
   actions:
     (cfg) => ({
 
@@ -768,3 +816,21 @@ module.exports = {
 
     })
 };
+=======
+  actions: (cfg) => ({
+    // Relève manuelle, utilisable dans un déclencheur Often en complément,
+    // ou depuis un bouton pour tester.
+    imap_idle_sync: {
+      configFields: [],
+      run: async () => {
+        const tenant = db.getTenantSchema();
+        return await runSync(cfg, async (payload) => {
+          await db.runWithTenant(tenant, async () => {
+            return await Trigger.emitEvent("MailRecu", cfg.folder || "INBOX", null, payload);
+          });
+        });
+      },
+    },
+  }),
+};
+>>>>>>> ec056b5 (update)

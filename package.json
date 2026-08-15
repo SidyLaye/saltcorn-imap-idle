@@ -1,11 +1,11 @@
 {
   "name": "saltcorn-imap-idle",
-  "version": "1.0.0",
-  "description": "Relève IMAP en temps réel (IDLE) avec curseur UID et contrôle d'UIDVALIDITY",
+  "version": "8.0.0",
+  "description": "Relève IMAP IDLE avec rejeu des traitements incomplets",
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
-    "imapflow": "^1.0.164",
-    "mailparser": "^3.6.5"
+    "imapflow": "^1.0.181",
+    "mailparser": "^3.7.2"
   }
 }
