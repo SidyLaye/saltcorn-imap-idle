@@ -1,836 +1,231 @@
 /**
- * smtp-envoi — plugin SMTP du pipeline Sélection Habitat.
+ * imap-idle V11 — plugin Saltcorn pour la relève Sélection Habitat.
  *
- * send.js gère le transport et l'envoi.
- * index.js expose la configuration et les actions Saltcorn.
+ * POINT IMPORTANT V11 : ./sync, imapflow et mailparser ne sont pas chargés au
+ * chargement initial du plugin. La configuration (engrenage), MailRecu et les
+ * actions restent donc enregistrés même si une dépendance IMAP est absente.
  */
+const Workflow = require("@saltcorn/data/models/workflow");
+const Form = require("@saltcorn/data/models/form");
+const Table = require("@saltcorn/data/models/table");
+const Trigger = require("@saltcorn/data/models/trigger");
+const db = require("@saltcorn/data/db");
+const cluster = require("cluster");
 
-const Workflow =
-  require(
-    "@saltcorn/data/models/workflow"
-  );
+const supervisors = new Map();
 
-const Form =
-  require(
-    "@saltcorn/data/models/form"
-  );
+const safeLog = (level, msg) => {
+  try {
+    const { getState } = require("@saltcorn/data/db/state");
+    getState().log(level, `[imap-idle] ${msg}`);
+  } catch (_) {
+    try { console.log(`[imap-idle:${level}] ${msg}`); } catch (_) {}
+  }
+};
 
-const Table =
-  require(
-    "@saltcorn/data/models/table"
-  );
+const loadSync = () => {
+  try {
+    return require("./sync");
+  } catch (e) {
+    throw new Error(
+      "imap-idle est chargé, mais son moteur de relève est indisponible : " +
+      (e && e.message ? e.message : String(e))
+    );
+  }
+};
 
-const {
-  runSend,
-  makeTransport,
-  normaliser,
-  contexte,
-  log
-} =
-  require(
-    "./send"
-  );
-
-
-const configuration_workflow =
-  () =>
-    new Workflow({
-
-      steps: [
-
-        {
-          name:
-            "Serveur SMTP",
-
-          form:
-            () =>
-              new Form({
-
-                blurb:
-                  "OVH mutualisé : ssl0.ovh.net, port 465, TLS coché. "
-                  + "OVH Exchange : ex.mail.ovh.net. "
-                  + "L'identifiant est l'adresse e-mail COMPLÈTE.",
-
-                fields: [
-
-                  {
-                    name:
-                      "host",
-
-                    label:
-                      "Serveur SMTP",
-
-                    type:
-                      "String",
-
-                    required:
-                      true,
-
-                    default:
-                      "ssl0.ovh.net",
-
-                    sublabel:
-                      "Nom du serveur seul, sans https:// ni port"
-                  },
-
-                  {
-                    name:
-                      "port",
-
-                    label:
-                      "Port",
-
-                    type:
-                      "Integer",
-
-                    default:
-                      465,
-
-                    sublabel:
-                      "465 avec TLS coché, ou 587 décoché (STARTTLS)"
-                  },
-
-                  {
-                    name:
-                      "tls",
-
-                    label:
-                      "TLS",
-
-                    type:
-                      "Bool",
-
-                    default:
-                      true,
-
-                    sublabel:
-                      "À cocher avec le port 465"
-                  },
-
-                  {
-                    name:
-                      "username",
-
-                    label:
-                      "Identifiant",
-
-                    type:
-                      "String",
-
-                    required:
-                      true,
-
-                    sublabel:
-                      "L'adresse e-mail complète"
-                  },
-
-                  {
-                    name:
-                      "password",
-
-                    label:
-                      "Mot de passe",
-
-                    type:
-                      "String",
-
-                    input_type:
-                      "password",
-
-                    required:
-                      true,
-
-                    sublabel:
-                      "Mot de passe du compte SMTP"
-                  },
-
-                  {
-                    name:
-                      "from_email",
-
-                    label:
-                      "Adresse expéditrice",
-
-                    type:
-                      "String",
-
-                    required:
-                      true,
-
-                    sublabel:
-                      "Adresse utilisée dans From. En général identique à l'identifiant SMTP."
-                  },
-
-                  /*
-                   * NOM FACULTATIF.
-                   */
-                  {
-                    name:
-                      "from_nom",
-
-                    label:
-                      "Nom affiché (optionnel)",
-
-                    type:
-                      "String",
-
-                    default:
-                      "",
-
-                    sublabel:
-                      "Facultatif. Si vide, seule l'adresse expéditrice est utilisée."
-                  },
-
-                  {
-                    name:
-                      "allow_self_signed",
-
-                    label:
-                      "Accepter un certificat auto-signé",
-
-                    type:
-                      "Bool",
-
-                    default:
-                      false
-                  }
-
-                ]
-              })
+const configuration_workflow = () =>
+  new Workflow({
+    steps: [
+      {
+        name: "Compte IMAP",
+        form: () => new Form({ fields: [
+          { name: "host", label: "Serveur IMAP", type: "String", required: true,
+            sublabel: "Nom du serveur seul, sans https:// ni port" },
+          { name: "port", label: "Port", type: "Integer", default: 993 },
+          { name: "tls", label: "TLS", type: "Bool", default: true },
+          { name: "username", label: "Identifiant", type: "String", required: true },
+          { name: "password", label: "Mot de passe", type: "String",
+            input_type: "password", required: true },
+          { name: "folder", label: "Dossier", type: "String", default: "INBOX" },
+          { name: "allow_self_signed", label: "Accepter un certificat auto-signé",
+            type: "Bool", default: false },
+        ] }),
+      },
+      {
+        name: "Table et champs",
+        form: async () => {
+          const tables = await Table.find({}, { cached: true });
+          return new Form({ fields: [
+            { name: "table_dest", label: "Table de destination", input_type: "select",
+              required: true, options: tables.map((t) => t.name) },
+            { name: "f_uid", label: "Champ UID", type: "String", default: "uid", required: true },
+            { name: "f_subject", label: "Champ objet", type: "String", default: "objet" },
+            { name: "f_from", label: "Champ expéditeur", type: "String", default: "expediteur" },
+            { name: "f_to", label: "Champ destinataire", type: "String", default: "destinataire" },
+            { name: "f_date", label: "Champ date", type: "String", default: "date_envoi" },
+            { name: "f_text", label: "Champ corps texte", type: "String", default: "corps_texte" },
+            { name: "f_html", label: "Champ corps HTML", type: "String", default: "corps_html" },
+          ] });
         },
+      },
+      {
+        name: "Temps réel",
+        form: () => new Form({ fields: [
+          { name: "idle_enabled", label: "Activer le temps réel (IDLE)", type: "Bool", default: true },
+          { name: "idle_renew_s", label: "Renouvellement IDLE (s)", type: "Integer", default: 240 },
+          { name: "safety_poll_s", label: "Relève de secours (s)", type: "Integer", default: 300 },
+          { name: "reconnect_s", label: "Délai avant reconnexion (s)", type: "Integer", default: 30 },
+        ] }),
+      },
+    ],
+  });
 
+class IdleSupervisor {
+  constructor(cfg, tenant) {
+    this.cfg = cfg;
+    this.tenant = tenant;
+    this.stopped = false;
+    this.client = null;
+    this.timer = null;
+    this.busy = false;
+  }
 
-        {
-          name:
-            "Journal et mode test",
+  async start() {
+    await this.sync("démarrage");
+    if (Number(this.cfg.safety_poll_s || 0) > 0) {
+      this.timer = setInterval(
+        () => this.sync("relève de secours"),
+        Number(this.cfg.safety_poll_s) * 1000
+      );
+    }
+    if (this.cfg.idle_enabled !== false) this.loop().catch((e) => safeLog(1, e.message));
+  }
 
-          form:
-            async () => {
+  async emit(payload) {
+    return await db.runWithTenant(this.tenant, async () =>
+      await Trigger.emitEvent("MailRecu", this.cfg.folder || "INBOX", null, payload)
+    );
+  }
 
-<<<<<<< HEAD
-              const tables =
-                await Table.find(
-                  {},
-                  {
-                    cached:
-                      true
-                  }
-                );
-
-=======
-  /** Une relève, protégée contre le recouvrement. */
   async sync(cause) {
     if (this.busy || this.stopped) return;
     this.busy = true;
     try {
-      // ★ Un événement par message, émis dès son insertion.
-      //
-      // C'est « MailRecu » qui pilote la chaîne de traitement, pas le
-      // déclencheur Insert de la table. Deux raisons :
-      //
-      //   • L'événement porte une charge utile explicite (identifiant de ligne,
-      //     expéditeur, objet) : le déclencheur sait exactement sur quoi
-      //     travailler, sans relire la table.
-      //   • Le canal est le dossier surveillé. Le jour où plusieurs boîtes sont
-      //     relevées, un déclencheur peut ne réagir qu'à l'une d'elles, sans
-      //     filtrer dans le code.
-      const emit = async (payload) => {
-        await db.runWithTenant(this.tenant, async () => {
-          return await Trigger.emitEvent(
-            "MailRecu",
-            this.cfg.folder || "INBOX",
-            null,
-            payload
-          );
-        });
-      };
-
-      const counts = await runSyncForTenant(this.cfg, this.tenant, emit);
-      if (counts.inserted || counts.emitted || counts.replayed)
-        log(4, `${cause} : ${counts.inserted || 0} enregistré(s), `
-          + `${counts.emitted || 0} événement(s) nouveau(x), `
-          + `${counts.replayed || 0} rejeu(x) pending`);
+      const sync = loadSync();
+      const counts = await sync.runSyncForTenant(this.cfg, this.tenant, (p) => this.emit(p));
+      if (counts.inserted || counts.emitted || counts.replayed) {
+        safeLog(4, `${cause} : ${counts.inserted || 0} enregistré(s), ` +
+          `${counts.emitted || 0} nouveau(x), ${counts.replayed || 0} rejeu(x)`);
+      }
     } catch (e) {
-      log(2, `${cause} en échec : ${e.message}`);
+      safeLog(2, `${cause} en échec : ${e.message}`);
     } finally {
       this.busy = false;
     }
   }
->>>>>>> ec056b5 (update)
 
-              return new Form({
+  async loop() {
+    while (!this.stopped) {
+      let client = null;
+      try {
+        const sync = loadSync();
+        client = sync.makeClient(this.cfg);
+        this.client = client;
+        await client.connect();
+        await client.mailboxOpen(this.cfg.folder || "INBOX", { readOnly: true });
+        safeLog(4, `IDLE actif sur ${this.cfg.folder || "INBOX"}`);
+        client.on("exists", () => setImmediate(() => this.sync("notification IDLE")));
+        client.on("error", (e) => safeLog(2, `erreur IDLE : ${e.message}`));
 
-                fields: [
-
-                  {
-                    name:
-                      "table_journal",
-
-                    label:
-                      "Table de journalisation",
-
-                    input_type:
-                      "select",
-
-                    required:
-                      true,
-
-                    options:
-                      tables.map(
-                        (t) =>
-                          t.name
-                      ),
-
-                    sublabel:
-                      "Attendue : notification. Colonnes : lead, destinataire, role, user_id, objet, statut, erreur, envoye_le"
-                  },
-
-                  {
-                    name:
-                      "redirection_test",
-
-                    label:
-                      "Adresses de redirection (mode test)",
-
-                    type:
-                      "String",
-
-                    default:
-                      "",
-
-                    sublabel:
-                      "Séparées par des virgules. En mode test, le message groupé part vers ces adresses au lieu des vrais destinataires. Vide = simulation pure."
-                  },
-
-                  {
-                    name:
-                      "mode_test",
-
-                    label:
-                      "MODE TEST — ne pas écrire aux vrais destinataires",
-
-                    type:
-                      "Bool",
-
-                    default:
-                      true,
-
-                    sublabel:
-                      "Coché + redirection vide : aucun SMTP. Coché + redirection : envoi vers les adresses de test. Décoché : production."
-                  }
-
-                ]
-              });
-            }
+        while (!this.stopped) {
+          await client.idle({ maxIdleTime: Number(this.cfg.idle_renew_s || 240) * 1000 });
         }
+      } catch (e) {
+        if (this.stopped) break;
+        const wait = Number(this.cfg.reconnect_s || 30) * 1000;
+        safeLog(2, `connexion IDLE perdue (${e.message}) — nouvelle tentative dans ${wait / 1000}s`);
+        await new Promise((r) => setTimeout(r, wait));
+      } finally {
+        if (client) {
+          try { await client.logout(); } catch (_) {}
+        }
+        this.client = null;
+      }
+    }
+  }
 
-      ]
-    });
+  async stop() {
+    this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    if (this.client) {
+      try { await this.client.logout(); } catch (_) {}
+    }
+  }
+}
 
+const onLoad = async (cfg) => {
+  try {
+    const tenant = db.getTenantSchema();
+    const previous = supervisors.get(tenant);
+    if (previous) await previous.stop();
+    supervisors.delete(tenant);
+
+    if (!cfg || !cfg.host || !cfg.username || !cfg.table_dest) return;
+    // Un worker secondaire n'ouvre pas une deuxième session IDLE.
+    if (cluster.isWorker) return;
+
+    // Teste les dépendances, mais NE PROPAGE JAMAIS l'erreur au chargeur de plugin.
+    // L'engrenage et les actions restent donc disponibles pour corriger la config.
+    try { loadSync().assertDependencies(); }
+    catch (e) { safeLog(1, `supervision IMAP non démarrée : ${e.message}`); return; }
+
+    const sup = new IdleSupervisor(cfg, tenant);
+    supervisors.set(tenant, sup);
+    sup.start().catch((e) => safeLog(1, `démarrage impossible : ${e.message}`));
+  } catch (e) {
+    safeLog(1, `onLoad ignoré pour préserver le plugin : ${e.message}`);
+  }
+};
 
 module.exports = {
-<<<<<<< HEAD
-
-  sc_plugin_api_version:
-    1,
-
-=======
   sc_plugin_api_version: 1,
   plugin_name: "imap-idle",
-  version: "8.0.0",
->>>>>>> ec056b5 (update)
   configuration_workflow,
+  onLoad,
+  eventTypes: () => ({ MailRecu: { hasChannel: true } }),
 
-
-<<<<<<< HEAD
-  actions:
-    (cfg) => ({
-
-
-      smtp_envoi_lead: {
-
-        configFields: [
-
-          {
-            name:
-              "cle_destinataires",
-
-            label:
-              "Variable — destinataires",
-
-            type:
-              "String",
-
-            default:
-              "destinataires_prevus",
-
-            sublabel:
-              "Tableau [{email, role, user_id}], ou liste d'adresses"
-          },
-
-          {
-            name:
-              "cle_sujet",
-
-            label:
-              "Variable — objet",
-
-            type:
-              "String",
-
-            default:
-              "sujet"
-          },
-
-          {
-            name:
-              "cle_corps",
-
-            label:
-              "Variable — corps HTML",
-
-            type:
-              "String",
-
-            default:
-              "corpsMail"
-          },
-
-          {
-            name:
-              "cle_lead",
-
-            label:
-              "Variable — id du lead",
-
-            type:
-              "String",
-
-            default:
-              "lead"
-          },
-
-          {
-            name:
-              "cle_mode_test",
-
-            label:
-              "Variable — mode test local",
-
-            type:
-              "String",
-
-            default:
-              "mode_test"
-          },
-
-          {
-            name:
-              "role_defaut",
-
-            label:
-              "Rôle par défaut",
-
-            type:
-              "String",
-
-            default:
-              "negociateur"
-          }
-
-        ],
-
-
-        run:
-          async (args) => {
-
-            try {
-
-              const ctx =
-                contexte(args);
-
-
-              const c =
-                args.configuration ||
-                {};
-
-
-              return await runSend({
-
-                cfg,
-
-                cibles:
-                  normaliser(
-                    ctx[
-                      c.cle_destinataires ||
-                      "destinataires_prevus"
-                    ],
-                    c.role_defaut ||
-                    "negociateur"
-                  ),
-
-                sujet:
-                  ctx[
-                    c.cle_sujet ||
-                    "sujet"
-                  ] ||
-                  "Nouveau lead",
-
-                corps:
-                  ctx[
-                    c.cle_corps ||
-                    "corpsMail"
-                  ],
-
-                leadId:
-                  ctx[
-                    c.cle_lead ||
-                    "lead"
-                  ],
-
-                modeTestLocal:
-                  c.cle_mode_test
-                    ? ctx[
-                        c.cle_mode_test
-                      ] === true
-                    : false
-              });
-
-
-            } catch (e) {
-
-
-              log(
-                1,
-                `exception dans smtp_envoi_lead : ${e.message}`
-              );
-
-
-              return {
-                nb_envoyes:
-                  0,
-
-                erreur_envoi:
-                  `exception : ${e.message}`
-              };
-            }
-          }
-      },
-
-
-      smtp_envoi_quarantaine: {
-
-        configFields: [
-
-          {
-            name:
-              "cle_motif",
-
-            label:
-              "Variable — motif",
-
-            type:
-              "String",
-
-            default:
-              "motif_quarantaine"
-          },
-
-          {
-            name:
-              "cle_email_id",
-
-            label:
-              "Variable — id e-mail source",
-
-            type:
-              "String",
-
-            default:
-              "email_id"
-          },
-
-          {
-            name:
-              "cle_reference",
-
-            label:
-              "Variable — référence extraite",
-
-            type:
-              "String",
-
-            default:
-              "reference"
-          },
-
-          {
-            name:
-              "cle_mode_test",
-
-            label:
-              "Variable — mode test local",
-
-            type:
-              "String",
-
-            default:
-              "mode_test"
-          }
-
-        ],
-
-
-        run:
-          async (args) => {
-
-            try {
-
-              const ctx =
-                contexte(args);
-
-
-              const c =
-                args.configuration ||
-                {};
-
-
-              const motif =
-                ctx[
-                  c.cle_motif ||
-                  "motif_quarantaine"
-                ] ||
-                "non précisé";
-
-
-              const emailId =
-                ctx[
-                  c.cle_email_id ||
-                  "email_id"
-                ] ||
-                "?";
-
-
-              const ref =
-                ctx[
-                  c.cle_reference ||
-                  "reference"
-                ] ||
-                "";
-
-
-              const tDest =
-                Table.findOne({
-                  name:
-                    "destinataire_custom"
-                });
-
-
-              const rows =
-                tDest
-                  ? await tDest.getRows({
-                      portee:
-                        "tous",
-
-                      actif:
-                        true
-                    })
-                  : [];
-
-
-              return await runSend({
-
-                cfg,
-
-                cibles:
-                  normaliser(
-                    rows.map(
-                      (r) =>
-                        r.email
-                    ),
-                    "quarantaine"
-                  ),
-
-                sujet:
-                  `[QUARANTAINE] e-mail ${emailId} — ${motif}`,
-
-                corps:
-                  `<p>Un e-mail n'a pas pu être traité automatiquement.</p><ul>`
-                  + `<li><b>Motif :</b> ${motif}</li>`
-                  + `<li><b>Référence extraite :</b> ${ref || "(aucune)"}</li>`
-                  + `<li><b>E-mail source :</b> ${emailId}</li></ul>`
-                  + `<p><b>Aucune écriture n'a été faite dans Immofacile.</b> Ce lead doit être traité à la main.</p>`,
-
-                leadId:
-                  null,
-
-                modeTestLocal:
-                  c.cle_mode_test
-                    ? ctx[
-                        c.cle_mode_test
-                      ] === true
-                    : false
-              });
-
-
-            } catch (e) {
-
-
-              log(
-                1,
-                `exception dans smtp_envoi_quarantaine : ${e.message}`
-              );
-
-
-              return {
-                nb_envoyes:
-                  0,
-
-                erreur_envoi:
-                  `exception : ${e.message}`
-              };
-            }
-          }
-      },
-
-
-      smtp_tester: {
-
-        configFields: [
-
-          {
-            name:
-              "adresse_test",
-
-            label:
-              "Envoyer à",
-
-            type:
-              "String",
-
-            required:
-              true,
-
-            sublabel:
-              "Une adresse que vous relevez vous-même"
-          }
-
-        ],
-
-
-        run:
-          async (args) => {
-
-            const dest =
-              (
-                args.configuration ||
-                {}
-              ).adresse_test;
-
-
-            try {
-
-              const tr =
-                makeTransport(
-                  cfg
-                );
-
-
-              await tr.verify();
-
-
-              const expediteur =
-                cfg.from_nom &&
-                String(
-                  cfg.from_nom
-                ).trim()
-
-                  ? {
-                      name:
-                        String(
-                          cfg.from_nom
-                        ).trim(),
-
-                      address:
-                        cfg.from_email
-                    }
-
-                  : cfg.from_email;
-
-
-              await tr.sendMail({
-
-                from:
-                  expediteur,
-
-                to:
-                  dest,
-
-                subject:
-                  "Test SMTP — pipeline Sélection Habitat",
-
-                html:
-                  "<p>Si vous lisez ceci, l'envoi fonctionne.</p>",
-
-                text:
-                  "Si vous lisez ceci, l'envoi fonctionne."
-              });
-
-
-              try {
-                tr.close();
-              } catch (e) {}
-
-
-              log(
-                4,
-                `test SMTP réussi vers ${dest}`
-              );
-
-
-              return {
-                notify:
-                  `✔ Envoyé à ${dest}. Vérifiez aussi le dossier spam.`
-              };
-
-
-            } catch (e) {
-
-
-              log(
-                2,
-                `test SMTP en échec : ${e.message}`
-              );
-
-
-              return {
-                error:
-                  `✘ ${e.message}\n\n`
-                  + `ETIMEDOUT / ESOCKET → port sortant bloqué ou serveur indisponible.\n`
-                  + `EAUTH / 454 → authentification SMTP refusée ou temporairement limitée.\n`
-                  + `wrong version number → vérifier port/TLS.`
-              };
-            }
-          }
-      }
-
-    })
-};
-=======
   actions: (cfg) => ({
-    // Relève manuelle, utilisable dans un déclencheur Often en complément,
-    // ou depuis un bouton pour tester.
     imap_idle_sync: {
       configFields: [],
       run: async () => {
+        const sync = loadSync();
         const tenant = db.getTenantSchema();
-        return await runSync(cfg, async (payload) => {
-          await db.runWithTenant(tenant, async () => {
-            return await Trigger.emitEvent("MailRecu", cfg.folder || "INBOX", null, payload);
-          });
-        });
+        return await sync.runSync(cfg, async (payload) =>
+          await db.runWithTenant(tenant, async () =>
+            await Trigger.emitEvent("MailRecu", cfg.folder || "INBOX", null, payload)
+          )
+        );
+      },
+    },
+
+    imap_idle_tester: {
+      configFields: [],
+      run: async () => {
+        let client = null;
+        try {
+          const sync = loadSync();
+          sync.assertDependencies();
+          client = sync.makeClient(cfg);
+          await client.connect();
+          const box = await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: true });
+          return { notify: `✔ IMAP connecté — ${cfg.folder || "INBOX"} — UIDNEXT ${box.uidNext || "?"}` };
+        } catch (e) {
+          return { error: `✘ ${e.message}` };
+        } finally {
+          if (client) { try { await client.logout(); } catch (_) {} }
+        }
       },
     },
   }),
 };
->>>>>>> ec056b5 (update)
