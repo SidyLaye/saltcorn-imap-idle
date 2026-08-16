@@ -1,12 +1,12 @@
 /**
- * imap-idle V20 — Git-native Saltcorn loader
+ * imap-idle V21 — Git-native Saltcorn loader
  *
  * Cette implémentation CommonJS est chargée par git-loader-v20.mjs.
  * Le point d’entrée ESM unique est volontaire : le loader Saltcorn actuel
- * fait import(main) puis retourne res.default. Le nom de main change en V20
+ * fait import(main) puis retourne res.default. Le nom de main change en V21
  * pour casser le cache d’un ancien module installé depuis une source Git.
  */
-console.log("### AMBS IMAP V20 CJS IMPLEMENTATION EVALUATED - plugin_name=imap-idle ###");
+console.log("### AMBS IMAP V21 CJS IMPLEMENTATION EVALUATED - plugin_name=imap-idle ###");
 
 const cluster = require("cluster");
 
@@ -28,7 +28,7 @@ const safeLog = (level, msg) => {
 
 const loadSync = () => {
   try {
-    return require("./sync-v20.cjs");
+    return require("./sync-v21.cjs");
   } catch (e) {
     throw new Error(
       "imap-idle est chargé mais le moteur IMAP est indisponible : " +
@@ -47,7 +47,7 @@ const cfg = () => {
 };
 
 const configuration_workflow = () => {
-  console.log("### AMBS IMAP V20 configuration_workflow CALLED ###");
+  console.log("### AMBS IMAP V21 configuration_workflow CALLED ###");
   const Workflow = require("@saltcorn/data/models/workflow");
   const Form = require("@saltcorn/data/models/form");
 
@@ -208,7 +208,7 @@ const startSupervisor = async (tenant) => {
 const onLoad = async (configuration) => {
   // IMPORTANT : mémorisé AVANT toute opération susceptible d'échouer.
   CURRENT_CFG = { ...(configuration || {}) };
-  console.log("### AMBS IMAP V20 onLoad CALLED ###");
+  console.log("### AMBS IMAP V21 onLoad CALLED ###");
 
   try {
     const db = getDb();
@@ -324,6 +324,9 @@ const actions = (pluginConfig = {}) => ({
       { name: "end_utc", label: "Fin UTC exclue", type: "String" },
       { name: "dry_run", label: "Scanner seulement", type: "Bool", default: false },
       { name: "replace_existing", label: "Mettre à jour UID existants", type: "Bool", default: false },
+      { name: "all_folders", label: "Historique : tous les dossiers reçus", type: "Bool", default: false },
+      { name: "include_trash", label: "Historique : inclure Trash/Corbeille", type: "Bool", default: false },
+      { name: "received_only", label: "Exclure Sent/Drafts/Junk", type: "Bool", default: true },
     ],
     run: async ({ configuration = {}, ...rest } = {}) => {
       const c = requirePluginCfg(pluginConfig);
@@ -362,16 +365,33 @@ const actions = (pluginConfig = {}) => ({
 
 const functions = (pluginConfig = {}) => ({
   imap_import_periode_fn: {
-    run: async (start_utc, end_utc, dry_run = false) => {
+    run: async (
+      start_utc,
+      end_utc,
+      dry_run = false,
+      all_folders = false,
+      include_trash = false,
+      received_only = true
+    ) => {
       const c = requirePluginCfg(pluginConfig);
-      return await loadSync().importPeriod(c, { start_utc, end_utc, dry_run });
+      return await loadSync().importPeriod(c, {
+        start_utc,
+        end_utc,
+        dry_run,
+        all_folders,
+        include_trash,
+        received_only,
+      });
     },
     isAsync: true,
-    description: "Importe une période IMAP avec la configuration enregistrée du plugin",
+    description: "Importe une période IMAP ; option historique multi-dossiers avec Trash, sans changer l'IDLE INBOX",
     arguments: [
       { name: "start_utc", type: "String" },
       { name: "end_utc", type: "String" },
       { name: "dry_run", type: "Bool" },
+      { name: "all_folders", type: "Bool" },
+      { name: "include_trash", type: "Bool" },
+      { name: "received_only", type: "Bool" },
     ],
   },
 });

@@ -1,5 +1,5 @@
 /**
- * Saltcorn Git-native loader for imap-idle V20.
+ * Saltcorn Git-native loader for imap-idle V21.
  *
  * Saltcorn's current PluginInstaller loads package.json.main with import()
  * and then uses res.default. This file therefore exposes an explicit ESM
@@ -13,24 +13,24 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
-console.log("### AMBS IMAP V20 GIT ESM ENTRY LOADED ###");
+console.log("### AMBS IMAP V21 GIT ESM ENTRY LOADED ###");
 
-const plugin = require("./imap-idle-plugin-v20.cjs");
+const plugin = require("./imap-idle-plugin-v21.cjs");
 
 if (!plugin || typeof plugin !== "object") {
-  throw new Error("imap-idle V20: le module interne n'a pas exporté un objet plugin");
+  throw new Error("imap-idle V21: le module interne n'a pas exporté un objet plugin");
 }
 if (plugin.plugin_name !== "imap-idle") {
   throw new Error(
-    `imap-idle V20: plugin_name invalide (${String(plugin.plugin_name)}), attendu: imap-idle`
+    `imap-idle V21: plugin_name invalide (${String(plugin.plugin_name)}), attendu: imap-idle`
   );
 }
 if (typeof plugin.configuration_workflow !== "function") {
-  throw new Error("imap-idle V20: configuration_workflow absent du module chargé");
+  throw new Error("imap-idle V21: configuration_workflow absent du module chargé");
 }
 
 console.log(
-  "### AMBS IMAP V20 GIT DEFAULT EXPORT READY ###",
+  "### AMBS IMAP V21 GIT DEFAULT EXPORT READY ###",
   Object.keys(plugin)
 );
 
