@@ -1,7 +1,11 @@
 {
   "name": "imap-idle",
-  "version": "1.9.0",
-  "description": "Diagnostic Saltcorn loader - imap-idle setup visibility - zero external dependencies",
-  "main": "index.js",
-  "license": "MIT"
+  "version": "2.0.0",
+  "description": "Saltcorn IMAP IDLE - Git-native ESM entrypoint with explicit default export and cache busting",
+  "main": "git-loader-v20.mjs",
+  "license": "MIT",
+  "dependencies": {
+    "imapflow": "1.x",
+    "mailparser": "3.x"
+  }
 }
