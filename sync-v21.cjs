@@ -159,13 +159,46 @@ const markSeenBatchSafe = async (client, uids, reason) => {
   try {
     if (typeof client.messageFlagsAdd !== "function")
       throw new Error("messageFlagsAdd indisponible");
-    await client.messageFlagsAdd(list, ["\\Seen"], { uid: true });
+    for (let i = 0; i < list.length; i += 200) {
+      await client.messageFlagsAdd(list.slice(i, i + 200), ["\\Seen"], { uid: true });
+    }
     log(4, `${reason} : ${list.length} message(s) marque(s) lu(s) dans INBOX`);
     return list.length;
   } catch (e) {
     log(2, `${reason} : marquage lu impossible : ${String(e && e.message ? e.message : e).slice(0, 400)}`);
     return 0;
   }
+};
+
+const unreadUidsSafe = async (client, reason) => {
+  try {
+    if (typeof client.search !== "function") throw new Error("search indisponible");
+    const found = await client.search({ seen: false }, { uid: true });
+    return (Array.isArray(found) ? found : [])
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0);
+  } catch (e) {
+    log(2, `${reason} : recherche non-lus impossible : ${String(e && e.message ? e.message : e).slice(0, 400)}`);
+    return [];
+  }
+};
+
+const markStoredTerminalUnread = async (cfg, table, client, reason) => {
+  const unread = await unreadUidsSafe(client, reason);
+  if (!unread.length) return 0;
+
+  const unreadSet = new Set(unread.map(Number));
+  const uidField = cfg.f_uid || "uid";
+  const rows = await table.getRows({});
+  const toMark = new Set();
+
+  for (const row of rows) {
+    const uid = Number(row[uidField]);
+    if (!Number.isFinite(uid) || uid <= 0 || !unreadSet.has(uid)) continue;
+    if (await terminalInfo(row)) toMark.add(uid);
+  }
+
+  return await markSeenBatchSafe(client, toMark, reason);
 };
 
 const runSyncCore = async (cfg, onMessage, tenant) => {
@@ -179,6 +212,8 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
     await client.connect();
     const box = await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: false });
     const uidsToMarkRead = new Set();
+    const rowsToEmit = [];
+    marked_read += await markStoredTerminalUnread(cfg, table, client, "rattrapage lignes deja traitees");
 
     const key = mailboxKey(cfg, tenant);
     const validity = String(box.uidValidity || client.mailbox?.uidValidity || "");
@@ -221,7 +256,7 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
             const saved = { id, ...row };
             inserted++;
             uidsToMarkRead.add(Number(m.uid));
-            if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) emitted++;
+            rowsToEmit.push(saved);
           }
         }
       }
@@ -238,9 +273,12 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
         const saved = { id, ...row };
         inserted++;
         uidsToMarkRead.add(Number(m.uid));
-        if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) emitted++;
+        rowsToEmit.push(saved);
       }
       marked_read += await markSeenBatchSafe(client, uidsToMarkRead, "messages nouveaux/deja en base");
+      for (const saved of rowsToEmit) {
+        if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) emitted++;
+      }
     }
 
     // Point essentiel : le max UID sert uniquement à l'INGESTION IMAP.
