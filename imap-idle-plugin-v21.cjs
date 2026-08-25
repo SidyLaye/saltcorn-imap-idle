@@ -135,9 +135,10 @@ class IdleSupervisor {
     try {
       const s = loadSync();
       const counts = await s.runSyncForTenant(this.cfg, this.tenant, (p) => this.emit(p));
-      if (counts.inserted || counts.emitted || counts.replayed) {
+      if (counts.inserted || counts.emitted || counts.replayed || counts.marked_read) {
         safeLog(4, `${cause} : ${counts.inserted || 0} enregistré(s), ` +
-          `${counts.emitted || 0} nouveau(x), ${counts.replayed || 0} rejeu(x)`);
+          `${counts.emitted || 0} nouveau(x), ${counts.replayed || 0} rejeu(x), ` +
+          `${counts.marked_read || 0} marque(s) lu(s)`);
       }
     } catch (e) {
       safeLog(2, `${cause} en échec : ${e.message}`);
