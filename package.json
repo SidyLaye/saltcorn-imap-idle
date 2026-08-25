@@ -1,8 +1,8 @@
 {
   "name": "imap-idle",
-  "version": "2.1.0",
-  "description": "Saltcorn IMAP IDLE - V21 Git ESM loader; realtime INBOX + multi-folder historical import including Trash",
-  "main": "git-loader-v21.mjs",
+  "version": "2.3.0",
+  "description": "Saltcorn IMAP IDLE - V23 Git ESM loader; realtime INBOX + multi-folder historical import including Trash",
+  "main": "git-loader-v23.mjs",
   "license": "MIT",
   "dependencies": {
     "imapflow": "1.x",
