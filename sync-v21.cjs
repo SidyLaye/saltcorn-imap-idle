@@ -150,16 +150,35 @@ const parseMessage = async (cfg, message) => {
   return row;
 };
 
+const markSeenBatchSafe = async (client, uids, reason) => {
+  const list = Array.from(uids || [])
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!list.length) return 0;
+
+  try {
+    if (typeof client.messageFlagsAdd !== "function")
+      throw new Error("messageFlagsAdd indisponible");
+    await client.messageFlagsAdd(list, ["\\Seen"], { uid: true });
+    log(4, `${reason} : ${list.length} message(s) marque(s) lu(s) dans INBOX`);
+    return list.length;
+  } catch (e) {
+    log(2, `${reason} : marquage lu impossible : ${String(e && e.message ? e.message : e).slice(0, 400)}`);
+    return 0;
+  }
+};
+
 const runSyncCore = async (cfg, onMessage, tenant) => {
   if (!cfg || !cfg.table_dest) throw new Error("configuration IMAP incomplète");
   const table = Table.findOne({ name: cfg.table_dest });
   if (!table) throw new Error(`table destination introuvable : ${cfg.table_dest}`);
 
   const client = makeClient(cfg);
-  let inserted = 0, emitted = 0, replayed = 0;
+  let inserted = 0, emitted = 0, replayed = 0, marked_read = 0;
   try {
     await client.connect();
-    const box = await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: true });
+    const box = await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: false });
+    const uidsToMarkRead = new Set();
 
     const key = mailboxKey(cfg, tenant);
     const validity = String(box.uidValidity || client.mailbox?.uidValidity || "");
@@ -193,11 +212,15 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
             // Hors changement UIDVALIDITY, l'UID existe déjà => ingestion déjà faite.
             if (!validityChanged) {
               const ex = (await table.getRows({ [cfg.f_uid || "uid"]: Number(m.uid) }, { limit: 1 }))[0];
-              if (ex) continue;
+              if (ex) {
+                uidsToMarkRead.add(Number(m.uid));
+                continue;
+              }
             }
             const id = await table.insertRow(row);
             const saved = { id, ...row };
             inserted++;
+            uidsToMarkRead.add(Number(m.uid));
             if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) emitted++;
           }
         }
@@ -206,13 +229,18 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
         const row = await parseMessage(cfg, m);
         if (!validityChanged) {
           const ex = (await table.getRows({ [cfg.f_uid || "uid"]: Number(m.uid) }, { limit: 1 }))[0];
-          if (ex) continue;
+          if (ex) {
+            uidsToMarkRead.add(Number(m.uid));
+            continue;
+          }
         }
         const id = await table.insertRow(row);
         const saved = { id, ...row };
         inserted++;
+        uidsToMarkRead.add(Number(m.uid));
         if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) emitted++;
       }
+      marked_read += await markSeenBatchSafe(client, uidsToMarkRead, "messages nouveaux/deja en base");
     }
 
     // Point essentiel : le max UID sert uniquement à l'INGESTION IMAP.
@@ -228,10 +256,13 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
       .slice(0, PENDING_BATCH);
 
     for (const r of candidats) {
-      if (await emitOnce(cfg, tenant, r, onMessage, "rejeu pending")) replayed++;
+      if (await emitOnce(cfg, tenant, r, onMessage, "rejeu pending")) {
+        replayed++;
+        marked_read += await markSeenBatchSafe(client, [r[cfg.f_uid || "uid"]], "rejeu pending emis");
+      }
     }
 
-    return { inserted, emitted, replayed };
+    return { inserted, emitted, replayed, marked_read };
   } finally {
     try { await client.logout(); } catch (e) {}
   }
@@ -656,4 +687,5 @@ module.exports = {
   assertDependencies,
   importPeriod,
   payloadFromRow,
+  markSeenBatchSafe,
 };
