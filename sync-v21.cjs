@@ -70,7 +70,10 @@ const mailboxKey = (cfg, tenant) => `${tenant || "default"}|${cfg.host}|${cfg.us
 
 const terminalInfo = async (raw) => {
   const issue = String(raw.issue || "").trim().toUpperCase();
-  if (["TRAITE", "NON_LEAD", "DOUTE", "QUARANTAINE"].includes(issue)) return issue;
+  // Regle AMBS : dans info@, seuls les messages qui ont abouti au siege
+  // ou a la quarantaine doivent etre marques comme lus.
+  if (["NON_LEAD", "DOUTE"].includes(issue)) return null;
+  if (["TRAITE", "QUARANTAINE"].includes(issue)) return issue;
   // États volontairement NON terminaux : ils doivent être rejoués après le TTL.
   if (["SMTP_ECHEC", "QUARANTAINE_EN_ATTENTE", "QUARANTAINE_SMTP_ECHEC"].includes(issue))
     return null;
@@ -96,6 +99,12 @@ const terminalInfo = async (raw) => {
   return null;
 };
 
+const workflowTerminalInfo = async (raw) => {
+  const issue = String(raw.issue || "").trim().toUpperCase();
+  if (["TRAITE", "NON_LEAD", "DOUTE", "QUARANTAINE"].includes(issue)) return issue;
+  return await terminalInfo(raw);
+};
+
 const payloadFromRow = (cfg, row) => ({
   id: row.id,
   uid: row[cfg.f_uid || "uid"],
@@ -112,7 +121,7 @@ const emitOnce = async (cfg, tenant, row, onMessage, reason) => {
   const last = G.inFlight.get(key) || 0;
   if (Date.now() - last < INFLIGHT_TTL_MS) return false;
 
-  const terminal = await terminalInfo(row);
+  const terminal = await workflowTerminalInfo(row);
   if (terminal) {
     // Migration douce des anciennes lignes : leur état terminal devient visible
     // pour les prochaines relèves, sans rejouer le workflow.
@@ -201,6 +210,25 @@ const markStoredTerminalUnread = async (cfg, table, client, reason) => {
   return await markSeenBatchSafe(client, toMark, reason);
 };
 
+const markRowSeenIfTerminal = async (cfg, table, client, row, reason) => {
+  const uid = Number(row[cfg.f_uid || "uid"]);
+  if (!Number.isFinite(uid) || uid <= 0) return 0;
+
+  let fresh = row;
+  if (row && row.id) {
+    try {
+      fresh = (await table.getRow({ id: row.id })) || row;
+    } catch (e) {
+      fresh = row;
+    }
+  }
+
+  const terminal = await terminalInfo(fresh);
+  if (!terminal) return 0;
+
+  return await markSeenBatchSafe(client, [uid], `${reason} (${terminal})`);
+};
+
 const runSyncCore = async (cfg, onMessage, tenant) => {
   if (!cfg || !cfg.table_dest) throw new Error("configuration IMAP incomplète");
   const table = Table.findOne({ name: cfg.table_dest });
@@ -211,7 +239,6 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
   try {
     await client.connect();
     const box = await client.mailboxOpen(cfg.folder || "INBOX", { readOnly: false });
-    const uidsToMarkRead = new Set();
     const rowsToEmit = [];
     marked_read += await markStoredTerminalUnread(cfg, table, client, "rattrapage lignes deja traitees");
 
@@ -248,14 +275,12 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
             if (!validityChanged) {
               const ex = (await table.getRows({ [cfg.f_uid || "uid"]: Number(m.uid) }, { limit: 1 }))[0];
               if (ex) {
-                uidsToMarkRead.add(Number(m.uid));
                 continue;
               }
             }
             const id = await table.insertRow(row);
             const saved = { id, ...row };
             inserted++;
-            uidsToMarkRead.add(Number(m.uid));
             rowsToEmit.push(saved);
           }
         }
@@ -265,19 +290,19 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
         if (!validityChanged) {
           const ex = (await table.getRows({ [cfg.f_uid || "uid"]: Number(m.uid) }, { limit: 1 }))[0];
           if (ex) {
-            uidsToMarkRead.add(Number(m.uid));
             continue;
           }
         }
         const id = await table.insertRow(row);
         const saved = { id, ...row };
         inserted++;
-        uidsToMarkRead.add(Number(m.uid));
         rowsToEmit.push(saved);
       }
-      marked_read += await markSeenBatchSafe(client, uidsToMarkRead, "messages nouveaux/deja en base");
       for (const saved of rowsToEmit) {
-        if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) emitted++;
+        if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) {
+          emitted++;
+          marked_read += await markRowSeenIfTerminal(cfg, table, client, saved, "nouveau message abouti");
+        }
       }
     }
 
@@ -296,7 +321,7 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
     for (const r of candidats) {
       if (await emitOnce(cfg, tenant, r, onMessage, "rejeu pending")) {
         replayed++;
-        marked_read += await markSeenBatchSafe(client, [r[cfg.f_uid || "uid"]], "rejeu pending emis");
+        marked_read += await markRowSeenIfTerminal(cfg, table, client, r, "rejeu pending abouti");
       }
     }
 
