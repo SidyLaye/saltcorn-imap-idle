@@ -68,6 +68,26 @@ const lastUid = async (cfg) => {
 
 const mailboxKey = (cfg, tenant) => `${tenant || "default"}|${cfg.host}|${cfg.username}|${cfg.folder || "INBOX"}`;
 
+// La pipeline Leads 2.14+ conserve l'identifiant de la ligne IMAP dans
+// ld_mails.message_id, puis relie ld_leads et dzf_envois par leurs identifiants.
+// Seul un envoi SMTP confirmé clôt un lead qui doit être notifié.
+const leadsTerminalInfo = async (raw) => {
+  const mails = Table.findOne({ name: "ld_mails" });
+  const leads = Table.findOne({ name: "ld_leads" });
+  if (!mails || !leads) return null;
+  const mail = (await mails.getRows({ message_id: `email_brut_selection_habitat:${raw.id}` }, { limit: 1 }))[0];
+  if (!mail) return null;
+  const lead = (await leads.getRows({ mail_id: mail.id }, { limit: 1 }))[0];
+  if (!lead || !lead.traite_le) return null;
+  const statut = String(lead.statut || "").toLowerCase();
+  if (["ignore", "suivi"].includes(statut)) return "TRAITE";
+  if (!["pret", "a_trier", "a_verifier"].includes(statut)) return null;
+  const envois = Table.findOne({ name: "dzf_envois" });
+  if (!envois) return null;
+  const envoye = (await envois.getRows({ reference: `lead ${lead.id}`, statut: "envoye" }, { limit: 1 }))[0];
+  return envoye ? "TRAITE" : null;
+};
+
 const terminalInfo = async (raw) => {
   const issue = String(raw.issue || "").trim().toUpperCase();
   // Regle AMBS : dans info@, seuls les messages qui ont abouti au siege
@@ -79,6 +99,13 @@ const terminalInfo = async (raw) => {
     return null;
 
   if (issue) return null;
+
+  try {
+    const nouveau = await leadsTerminalInfo(raw);
+    if (nouveau) return nouveau;
+  } catch (e) {
+    log(2, `verification du traitement Leads impossible pour ${raw.id} : ${String(e && e.message ? e.message : e).slice(0, 300)}`);
+  }
 
   try {
     const tQ = Table.findOne({ name: "quarantaine" });
@@ -751,4 +778,6 @@ module.exports = {
   importPeriod,
   payloadFromRow,
   markSeenBatchSafe,
+  leadsTerminalInfo,
+  terminalInfo,
 };
