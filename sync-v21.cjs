@@ -27,6 +27,7 @@ const G = globalThis[STATE_KEY] || (globalThis[STATE_KEY] = {
   uidValidity: new Map(),
   inFlight: new Map(),
 });
+G.pendingCursor ||= new Map();
 
 const log = (level, msg) => {
   try { require("@saltcorn/data/models/eventlog").default?.log?.(level, msg); }
@@ -343,15 +344,24 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
     // Le succès du workflow est suivi séparément avec email_brut.issue.
     // Une exception du workflow ne peut donc plus faire disparaître un mail.
     const rows = await table.getRows({});
-    const candidats = rows
+    const enAttente = rows
       .filter((r) => {
         const issue = String(r.issue || "").trim().toUpperCase();
         return !issue || ["SMTP_ECHEC", "QUARANTAINE_EN_ATTENTE", "QUARANTAINE_SMTP_ECHEC"].includes(issue);
       })
-      .sort((a, b) => Number(a.id) - Number(b.id))
-      .slice(0, PENDING_BATCH);
+      .sort((a, b) => Number(a.id) - Number(b.id));
+    // Un lot fixe sur les 25 plus anciennes lignes affame les suivantes si
+    // les premières restent sans envoi. Tourner sur toute la liste à chaque relève.
+    const pendingKey = `${tenant || "default"}|${cfg.table_dest}`;
+    const lastPending = Number(G.pendingCursor.get(pendingKey) || 0);
+    const next = enAttente.findIndex((r) => Number(r.id) > lastPending);
+    const start = next < 0 ? 0 : next;
+    const candidats = enAttente.length <= PENDING_BATCH ? enAttente :
+      [...enAttente.slice(start, start + PENDING_BATCH),
+        ...enAttente.slice(0, Math.max(0, PENDING_BATCH - (enAttente.length - start)))];
 
     for (const r of candidats) {
+      G.pendingCursor.set(pendingKey, Number(r.id));
       if (await emitOnce(cfg, tenant, r, onMessage, "rejeu pending")) {
         replayed++;
         marked_read += await markRowSeenIfTerminal(cfg, table, client, r, "rejeu pending abouti");
