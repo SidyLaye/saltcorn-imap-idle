@@ -54,16 +54,17 @@ const addrList = (x) => {
   return "";
 };
 
-const lastUid = async (cfg) => {
+const uidState = async (cfg) => {
   const table = Table.findOne({ name: cfg.table_dest });
   if (!table) throw new Error(`table destination introuvable : ${cfg.table_dest}`);
   const rows = await table.getRows({});
   let max = 0;
+  const known = new Set();
   for (const r of rows) {
     const n = Number(r[cfg.f_uid || "uid"]);
-    if (Number.isFinite(n) && n > max) max = n;
+    if (Number.isFinite(n) && n > 0) { known.add(n); if (n > max) max = n; }
   }
-  return max;
+  return { max, known };
 };
 
 const mailboxKey = (cfg, tenant) => `${tenant || "default"}|${cfg.host}|${cfg.username}|${cfg.folder || "INBOX"}`;
@@ -270,7 +271,8 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
     const validityChanged = !!previousValidity && !!validity && previousValidity !== validity;
     if (validity) G.uidValidity.set(key, validity);
 
-    let cursor = validityChanged ? 0 : await lastUid(cfg);
+    const state = validityChanged ? { max: 0, known: new Set() } : await uidState(cfg);
+    let cursor = state.max;
     const uidNext = Number(box.uidNext || client.mailbox?.uidNext || 0);
 
     // Après un redémarrage, le UIDVALIDITY mémoire est perdu. Si le serveur a
@@ -278,8 +280,42 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
     if (!validityChanged && cursor > 0 && uidNext > 0 && cursor >= uidNext) {
       log(2, `séquence UID réinitialisée (cursor=${cursor}, uidNext=${uidNext}) — reprise depuis 0`);
       cursor = 0;
+      state.known.clear();
     }
     if (validityChanged) log(2, `UIDVALIDITY changé — reprise IMAP depuis UID 1`);
+
+    const ingest = async (message, cause) => {
+      const uid = Number(message && message.uid);
+      if (!Number.isFinite(uid) || uid <= 0 || (!validityChanged && state.known.has(uid))) return;
+      try {
+        const row = await parseMessage(cfg, message);
+        const id = await table.insertRow(row);
+        state.known.add(uid);
+        rowsToEmit.push({ id, ...row });
+        inserted++;
+      } catch (e) {
+        log(2, `${cause} : UID ${uid} non ingéré : ${String(e && e.message ? e.message : e).slice(0, 300)}`);
+      }
+    };
+
+    // Un message peut avoir été sauté pendant qu'un UID plus élevé était déjà
+    // enregistré. Le curseur max seul ne le reverrait jamais. On réconcilie
+    // les UID des 48 dernières heures, lus ou non, avant les nouveaux UID.
+    if (!validityChanged && cursor > 0) {
+      try {
+        const recent = await client.search({ since: new Date(Date.now() - 48 * 3600 * 1000) }, { uid: true });
+        const gaps = (Array.isArray(recent) ? recent : []).map(Number)
+          .filter((uid) => Number.isFinite(uid) && uid > 0 && uid <= cursor && !state.known.has(uid))
+          .sort((a, b) => a - b);
+        for (let i = 0; i < gaps.length; i += FETCH_BATCH) {
+          for await (const message of client.fetch(gaps.slice(i, i + FETCH_BATCH).join(","),
+            { uid: true, source: true, envelope: true, internalDate: true }, { uid: true }))
+            await ingest(message, "réconciliation UID manquant");
+        }
+      } catch (e) {
+        log(2, `réconciliation des UID impossible : ${String(e && e.message ? e.message : e).slice(0, 300)}`);
+      }
+    }
 
     const startUid = cursor + 1;
     if (uidNext === 0 || startUid < uidNext) {
@@ -291,40 +327,15 @@ const runSyncCore = async (cfg, onMessage, tenant) => {
         if (!message.uid || Number(message.uid) <= cursor) continue;
         lot.push(message);
         if (lot.length >= FETCH_BATCH) {
-          for (const m of lot.splice(0)) {
-            const row = await parseMessage(cfg, m);
-            // Hors changement UIDVALIDITY, l'UID existe déjà => ingestion déjà faite.
-            if (!validityChanged) {
-              const ex = (await table.getRows({ [cfg.f_uid || "uid"]: Number(m.uid) }, { limit: 1 }))[0];
-              if (ex) {
-                continue;
-              }
-            }
-            const id = await table.insertRow(row);
-            const saved = { id, ...row };
-            inserted++;
-            rowsToEmit.push(saved);
-          }
+          for (const m of lot.splice(0)) await ingest(m, "nouveau message");
         }
       }
-      for (const m of lot) {
-        const row = await parseMessage(cfg, m);
-        if (!validityChanged) {
-          const ex = (await table.getRows({ [cfg.f_uid || "uid"]: Number(m.uid) }, { limit: 1 }))[0];
-          if (ex) {
-            continue;
-          }
-        }
-        const id = await table.insertRow(row);
-        const saved = { id, ...row };
-        inserted++;
-        rowsToEmit.push(saved);
-      }
-      for (const saved of rowsToEmit) {
-        if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) {
-          emitted++;
-          marked_read += await markRowSeenIfTerminal(cfg, table, client, saved, "nouveau message abouti");
-        }
+      for (const m of lot) await ingest(m, "nouveau message");
+    }
+    for (const saved of rowsToEmit) {
+      if (await emitOnce(cfg, tenant, saved, onMessage, "nouveau message")) {
+        emitted++;
+        marked_read += await markRowSeenIfTerminal(cfg, table, client, saved, "nouveau message abouti");
       }
     }
 
