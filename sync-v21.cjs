@@ -70,7 +70,7 @@ const mailboxKey = (cfg, tenant) => `${tenant || "default"}|${cfg.host}|${cfg.us
 
 // La pipeline Leads 2.14+ conserve l'identifiant de la ligne IMAP dans
 // ld_mails.message_id, puis relie ld_leads et dzf_envois par leurs identifiants.
-// Seul un envoi SMTP confirmé clôt un lead qui doit être notifié.
+// Seul un envoi SMTP confirmé clôt un mail, y compris en quarantaine.
 const leadsTerminalInfo = async (raw) => {
   const mails = Table.findOne({ name: "ld_mails" });
   const leads = Table.findOne({ name: "ld_leads" });
@@ -79,27 +79,16 @@ const leadsTerminalInfo = async (raw) => {
   if (!mail) return null;
   const lead = (await leads.getRows({ mail_id: mail.id }, { limit: 1 }))[0];
   if (!lead || !lead.traite_le) return null;
-  const statut = String(lead.statut || "").toLowerCase();
-  if (["ignore", "suivi"].includes(statut)) return "TRAITE";
-  if (!["pret", "a_trier", "a_verifier"].includes(statut)) return null;
   const envois = Table.findOne({ name: "dzf_envois" });
   if (!envois) return null;
-  const envoye = (await envois.getRows({ reference: `lead ${lead.id}`, statut: "envoye" }, { limit: 1 }))[0];
-  return envoye ? "TRAITE" : null;
+  const envoiConfirme = (await envois.getRows({ reference: `lead ${lead.id}`, statut: "envoye" }))
+    .some((e) => !!e.envoye_le);
+  return envoiConfirme ? "TRAITE" : null;
 };
 
 const terminalInfo = async (raw) => {
-  const issue = String(raw.issue || "").trim().toUpperCase();
-  // Regle AMBS : dans info@, seuls les messages qui ont abouti au siege
-  // ou a la quarantaine doivent etre marques comme lus.
-  if (["NON_LEAD", "DOUTE"].includes(issue)) return null;
-  if (["TRAITE", "QUARANTAINE"].includes(issue)) return issue;
-  // États volontairement NON terminaux : ils doivent être rejoués après le TTL.
-  if (["SMTP_ECHEC", "QUARANTAINE_EN_ATTENTE", "QUARANTAINE_SMTP_ECHEC"].includes(issue))
-    return null;
-
-  if (issue) return null;
-
+  // Le champ issue et la présence d'une ligne de quarantaine ne prouvent pas
+  // que le serveur SMTP a effectivement accepté un envoi.
   try {
     const nouveau = await leadsTerminalInfo(raw);
     if (nouveau) return nouveau;
@@ -110,25 +99,31 @@ const terminalInfo = async (raw) => {
   try {
     const tQ = Table.findOne({ name: "quarantaine" });
     if (tQ) {
-      const q = (await tQ.getRows({ email_brut: raw.id }, { limit: 1 }))[0];
-      if (q) return "QUARANTAINE";
+      const sent = (await tQ.getRows({ email_brut: raw.id })).some((q) => !!q.envoye_le);
+      if (sent) return "QUARANTAINE";
     }
-  } catch (e) {}
+  } catch (e) {
+    log(2, `verification de la quarantaine impossible pour ${raw.id} : ${String(e && e.message ? e.message : e).slice(0, 300)}`);
+  }
 
   try {
     const tL = Table.findOne({ name: "lead" });
-    if (tL) {
-      const l = (await tL.getRows({ email_brut: raw.id }, { limit: 1 }))[0];
-      if (l && ["publie", "mis_a_jour"].includes(String(l.statut || "").toLowerCase())) return "TRAITE";
+    const tE = Table.findOne({ name: "vue_envoi" });
+    if (tL && tE) {
+      const leads = await tL.getRows({ email_brut: raw.id });
+      for (const l of leads) {
+        const sent = (await tE.getRows({ lead: l.id, statut: "envoye" })).some((e) => !!e.envoye_le);
+        if (sent) return "TRAITE";
+      }
     }
-  } catch (e) {}
+  } catch (e) {
+    log(2, `verification des anciens envois impossible pour ${raw.id} : ${String(e && e.message ? e.message : e).slice(0, 300)}`);
+  }
 
   return null;
 };
 
 const workflowTerminalInfo = async (raw) => {
-  const issue = String(raw.issue || "").trim().toUpperCase();
-  if (["TRAITE", "NON_LEAD", "DOUTE", "QUARANTAINE"].includes(issue)) return issue;
   return await terminalInfo(raw);
 };
 
@@ -152,7 +147,7 @@ const emitOnce = async (cfg, tenant, row, onMessage, reason) => {
   if (terminal) {
     // Migration douce des anciennes lignes : leur état terminal devient visible
     // pour les prochaines relèves, sans rejouer le workflow.
-    if (!row.issue) {
+    if (!["TRAITE", "QUARANTAINE"].includes(String(row.issue || "").trim().toUpperCase())) {
       try {
         const t = Table.findOne({ name: cfg.table_dest });
         await t.updateRow({ issue: terminal }, row.id);
